@@ -503,3 +503,88 @@ BUILD ORDER
 3. the cache: lifespan fetch, background refresh, atomic swap.
 4. GET /recalls, GET /recalls/{source_id}, the envelope, /health status.
 5. ship it. phase 2 only after a frontend or app exists.
+
+
+WRAPPER INTERNALS - LAYOUT AND FLOW
+-----------------------------------
+decided 2026-09-17. where each piece lives and what it is allowed to know.
+
+  app/
+    models.py          Recall, Severity, Status, State enum
+                       canonical. knows NOTHING about any source.
+    openfda/
+      __init__.py      fetch_recalls() -> list[Recall] + meta
+                       the only thing outside this folder may import
+      query.py         build the openfda search string   (pure)
+      client.py        http, status codes, paging -> raw dicts
+      mapper.py        one raw dict -> one Recall
+      patterns.py      distribution_pattern -> (states, is_nationwide)
+    filters.py         matches_state(), sort order. works on Recall,
+                       any source, no openfda knowledge
+    cache.py           the snapshot + refresh loop
+    routes.py          /health, /recalls, /recalls/{source_id}
+
+THE DEPENDENCY RULE
+  app/openfda/ imports app/models.py.
+  NOTHING outside app/openfda/ ever names an openfda field.
+  grep for distribution_pattern or recall_number outside that folder -
+  a hit means something leaked.
+
+  litmus test: adding fsis later = create app/fsis/ with its own client
+  and mapper, change nothing else. routes, filters, cache and models
+  keep working because they only ever saw Recall. if adding a source
+  forces an edit to routes.py, the boundary is wrong.
+
+REQUEST FLOW
+  user -> routes.py -> cache.py -> openfda.fetch_recalls()
+                                     query -> client -> mapper
+                                                          |
+          filters.py (matches_state, sort) <-- Recall ----+
+                                |
+          routes.py wraps in the envelope -> user
+
+  the user never triggers a live openfda call. routes read the snapshot.
+  the only caller of fetch_recalls() is the cache refresh.
+
+WHO RETURNS WHAT
+  client.py   returns RAW dicts. deliberate - real responses get saved
+              as test fixtures, and the mapper is then tested with no
+              network at all.
+  mapper.py   returns Recall.
+  __init__.py does both, exposes Recall objects + meta. callers get a
+              clean surface, both halves stay independently testable.
+
+MAPPER vs PATTERNS - why they are separate files
+  mapper.py   renames fields, maps the two enums, parses the dates,
+              truncates the title, drops the ~12 noise fields
+              (center_classified_date, more_code_info, event_id,
+              the empty openfda:{}, firm address lines), keeps raw.
+              boring on purpose. ~30 lines.
+              owns the judgment calls: title length, a missing
+              recalling_firm, what a malformed date does.
+
+  patterns.py the free text parser. the three rules already written
+              above under LOCATION FILTERING. ~15 lines and the highest
+              risk code in the project.
+
+  they differ in every way that matters:
+    failure mode  - a mapper bug shows a wrong label.
+                    a patterns bug HIDES a recall from someone who
+                    lives in that state.
+    test weight   - patterns gets dozens of cases including every odd
+                    real string ever seen. mapper needs a handful.
+    lifespan      - patterns keeps improving as new phrasings turn up.
+                    that is exactly why Recall keeps raw: with a db in
+                    phase 2 you replay the better parser over stored
+                    records instead of refetching.
+    portability   - fsis would need NO patterns file at all, its states
+                    come back as a real list. it would still need its
+                    own mapper.
+
+PARSING IS SOURCE SPECIFIC, FILTERING IS NOT
+  patterns.py is inside openfda/ because distribution_pattern is an
+  openfda field.
+  matches_state(recall, "CA") is outside in filters.py because it reads
+  is_nationwide and states off the normalized model. it must stay a
+  function over Recall objects - not a sql string, not a lucene string -
+  so the phase 2 database swap changes only where the list comes from.
