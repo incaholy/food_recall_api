@@ -39,7 +39,7 @@ the request of the data from the API
 - the request data should be cached in the frontend for refreshed (do not worry for now)
 
 
-endpoint lists
+endpoint lists   [SUPERSEDED 2026-09-17 - user endpoints dropped in phase 1]
 user
 - POST /register: makes a user
 - POST /login: login the user with username and password
@@ -157,7 +157,7 @@ query shape that works:
 volume: 861 records for all of 2026 so far. 29317 all time.
 
 
-AUTH
+AUTH   [SUPERSEDED 2026-09-17 - no accounts in phase 1, see PROJECT DIRECTION]
 ----
 - password hashing: argon2 or bcrypt via pwdlib. never store plaintext
 - POST /login returns {"access_token": "...", "token_type": "bearer"}
@@ -173,7 +173,7 @@ AUTH
 - POST /login and POST /register are public but need rate limiting
 
 
-DATABASE
+DATABASE   [SUPERSEDED 2026-09-17 - no db in phase 1, in-memory cache instead]
 --------
 users table:
   id             int pk
@@ -187,7 +187,7 @@ sqlite for development, postgres later.
 alembic for migrations. commit alembic/versions/, it is source code.
 
 
-API CONTRACT
+API CONTRACT   [SUPERSEDED 2026-09-17 - see PHASE 1 API CONTRACT below]
 ------------
 POST   /register   {email, password, state} -> {id, email, state}
 POST   /login      {email, password}        -> {access_token, token_type}
@@ -236,7 +236,7 @@ this is a food safety app, users may act on what it shows.
 - show the last sync / last fetched time so users can judge freshness
 
 
-NON GOALS FOR V1
+NON GOALS FOR V1   [REVISED 2026-09-17 - push notifications moved to phase 2]
 ----------------
 - FSIS / USDA meat poultry egg data (blocked, see limitations)
 - password reset (needs email sending)
@@ -246,7 +246,7 @@ NON GOALS FOR V1
 - ingredient or allergen search
 
 
-OPEN DECISIONS
+OPEN DECISIONS   [1-4 RESOLVED 2026-09-17, see bottom. 5 still open]
 --------------
 1. STORAGE - the big one, still unresolved.
    spec currently says "the request data is not saved".
@@ -339,3 +339,167 @@ THE GAP IS BY REGULATOR, NOT BY INGREDIENT
 revisit this when: fsis grants server side access, or the project
 accepts a clearly labelled best effort second source with a staleness
 check that falls back to the disclosure when the data goes stale.
+
+
+PROJECT DIRECTION - WRAPPER FIRST, NOTIFICATIONS LATER
+------------------------------------------------------
+decided 2026-09-16. this replaces the account based design written
+above. the sections marked SUPERSEDED stay in the file as history, they
+are not the plan.
+
+what this project is:
+  a readable wrapper over the openFDA food enforcement api.
+  it builds the search, it cleans up the response, it is honest about
+  what it does not cover. that is the whole product.
+
+why the accounts went away:
+  register/login/me was 5 of 8 endpoints and close to none of the value.
+  the value is the three location rules, the distribution_pattern
+  parser, the normalizing, and the disclosure. none of that needs a user
+  row. a saved default location works fine in localStorage on the client
+  until there is a reason for it to live on the server.
+
+
+PHASE 1 - THE WRAPPER  (now)
+----------------------------
+no database. no accounts. no auth. no alembic. no migrations.
+requires: fastapi, httpx, pydantic, uvicorn. nothing else yet.
+
+going in - query construction
+  caller sends simple params, we build the openfda search string.
+  the caller never types a field name and cannot get the three
+  location rules wrong, because they are not the caller's job.
+
+    ?state=CA&severity=CLASS_I
+      ->
+    search=(distribution_pattern:"CA" OR distribution_pattern:"nationwide")
+           AND classification:"Class I"
+           AND report_date:[<window>]
+    limit=1000
+
+coming out - the cleanup
+  openfda returns ~25 fields per record, most of it noise (firm address
+  lines, center_classified_date, more_code_info, event_id, an empty
+  openfda:{}). we return the normalized model defined above and nothing
+  else. the transforms that earn their place:
+    "20160808"                -> a real date
+    "Class I"                 -> CLASS_I
+    "Ongoing" / "Pending"     -> ACTIVE
+    "FL, MI, MS, and OH."     -> ["FL","MI","MS","OH"], is_nationwide false
+    unparseable pattern       -> is_nationwide true  (rule 3)
+    404                       -> []
+
+  the response envelope carries, every time:
+    disclaimer     openfda meta.disclaimer
+    last_fetched   cache timestamp, so staleness is visible
+    total          count
+    has_critical   any returned recall is CLASS_I and ACTIVE
+
+
+PHASE 1 API CONTRACT
+--------------------
+GET /health                 -> {"status": "ok", cache age + status}
+GET /recalls?state=&severity=&status=&limit=&offset=  -> envelope + [Recall]
+GET /recalls/{source_id}    -> Recall
+
+state is now a REQUIRED param with no user default to fall back on.
+still a validated enum, so a bad value is a 422 and /docs renders a
+dropdown. sort order and the three location rules are unchanged.
+
+
+CACHING - NO DATABASE
+---------------------
+the whole current window fits in ONE request (861 records for 2026,
+limit is 1000), so we hold one shared snapshot and filter it in python.
+
+  cache = { records: list[Recall], fetched_at, disclaimer, status }
+
+  - fetch on startup in the fastapi lifespan, then a background task
+    refreshes every few hours. requests never wait on openfda.
+  - build the new list fully, THEN rebind. never mutate in place, a
+    single rebind is atomic and readers need no lock.
+  - a failed refresh KEEPS the old data, logs, leaves fetched_at alone
+    so the staleness shows. never replace good data with an empty list -
+    a food safety app showing zero recalls is worse than a stale one.
+  - if the very first fetch fails the app still starts and /recalls
+    returns 503. do not crash loop because someone else's api is down.
+  - do NOT cache per query results. filtering 861 objects is microseconds
+    and a key of (state,severity,status,limit,offset) buys nothing.
+
+  quota: ~4-8 openfda calls a day total, no matter how many users.
+
+  single worker only. --workers N gives N independent caches, N times
+  the quota burn, and a different last_fetched depending on who answers.
+  same reason this does not suit serverless / scale to zero.
+
+  the frontend cache mentioned in the original spec is a separate layer -
+  etag / cache-control on OUR responses. fetched_at is the natural etag.
+
+
+PHASE 2 - PHONE APP + NOTIFICATIONS  (later, not now)
+------------------------------------------------------
+the goal: a phone alert when a MAJOR recall lands in the area the user
+picked. major = CLASS_I and ACTIVE. not every new recall - alert too
+often and people turn notifications off, and then the feature is worth
+nothing.
+
+this is the point where a database becomes REQUIRED, for one reason:
+you cannot tell that a recall is new without remembering what you
+already saw, and that memory has to survive a restart.
+
+  recalls    the normalized rows + first_seen_at.
+             new = a source_id we have never stored. that is the
+             entire alert trigger.
+  devices    push token + the state it watches. NOT accounts -
+             a phone can register a token and a state with no email
+             and no password, so we store no personal data and there
+             is no breach surface.
+
+  delivery: expo push, or fcm/apns direct. sms was considered and
+  dropped - a2p 10dlc registration, per message cost, and tcpa consent
+  for a feature push does for free.
+
+  wording matters: openfda publishes a recall after fda classifies it,
+  which can be days or weeks after the firm announced it. the app must
+  say "newly reported", never imply breaking news.
+
+  keep the phase 1 -> phase 2 swap cheap: the location rule must be a
+  FUNCTION OVER NORMALIZED RECALL OBJECTS
+      is_nationwide or state in states
+  not a sql string and not a lucene string. then the only thing that
+  changes is where the list comes from. this is also why the model
+  keeps raw - when the parser improves you re-normalize locally.
+
+  switch to a database when any ONE of these is true, not before:
+    1. you want notifications          (automatic yes)
+    2. you need more than one worker or instance
+    3. you want history, trends, or permanent recall links
+    4. you deploy somewhere that scales to zero
+    5. you want real accounts instead of client side localStorage
+
+
+OPEN DECISIONS - RESOLVED 2026-09-17
+------------------------------------
+1. STORAGE - resolved. in-memory snapshot cache for phase 1, database
+   in phase 2. option B's argument was right, it just does not need
+   postgres yet.
+2. token expiry - moot, no tokens in phase 1.
+3. username or email - moot, no users in phase 1.
+4. DELETE /me cascade - moot, endpoint is gone. with nothing stored per
+   user there was never anything to cascade.
+5. report_date vs recall_initiation_date - STILL OPEN. it decides what
+   the query window means. related: the window should be TRAILING
+   (last 12-24 months), not the calendar year. on jan 2 a calendar year
+   filter leaves the cache nearly empty while december recalls are
+   still very much active.
+
+
+BUILD ORDER
+-----------
+1. openfda client + distribution_pattern parser, tested against the
+   real examples in this file. highest risk code, no deps, pure
+   functions, no network needed in the tests.
+2. the normalized model + the mapper.
+3. the cache: lifespan fetch, background refresh, atomic swap.
+4. GET /recalls, GET /recalls/{source_id}, the envelope, /health status.
+5. ship it. phase 2 only after a frontend or app exists.
