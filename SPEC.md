@@ -980,3 +980,95 @@ TEST CASES - ALL OF THE ABOVE ARE THE FIXTURE
   every string quoted in this section goes in the parser test suite,
   including the traps and the known limitation. they are real values
   from the live api, not invented ones.
+
+
+PHASE 2 REVIEW - WHAT THE ALERT PATH ACTUALLY NEEDS
+----------------------------------------------------
+written 2026-09-17. still not being built now. this is the design so
+that phase 1 does not paint us into a corner.
+
+VOLUME - MEASURED, AND IT VALIDATES "CLASS I ONLY"
+  over the 18 month window:
+    841 events, 317 of them Class I  = 17.6 class I per month nationally
+    61 of those 317 are nationwide (19%) - everyone gets those
+    worst month: 28 class I events
+
+  alerts a single user would receive:
+    CA  7.4/month     NY  8.4/month     WY  4.0/month
+  roughly 1-2 a week. noticeable, not spam. class I + class II would be
+  about triple that, which is how you get notifications switched off.
+  THRESHOLD STAYS: CLASS_I and ACTIVE.
+
+1. THE BACKFILL STORM
+   first sync stores 841 events, every one of them looks new, everyone
+   gets hundreds of notifications.
+   do BOTH of these, they fail differently:
+     a. a seed run writes everything with alertable = false. alerting
+        starts only for records first seen AFTER the seed finished.
+     b. a freshness guard: never alert on anything whose report_date is
+        older than ~14 days. this also covers fda republishing or
+        backfilling an old record months later.
+
+2. UPSERT, NEVER INSERT-ONLY
+   openfda EDITS records in place - Ongoing -> Terminated, and
+   classifications get revised. "skip if source_id exists" means status
+   never updates and the app shows recalls as active forever.
+   upsert on (source, source_id). preserve first_seen_at, update
+   last_seen_at, keep a content hash to tell a real change from a no-op.
+   considered: append every version as a new row. more faithful, better
+   audit trail, but more storage and every query needs latest-version
+   logic. not worth it yet.
+
+3. RECLASSIFICATION IS A TRIGGER
+   "new source_id" misses a class II upgraded to class I - a recall that
+   just became serious, which is exactly when someone wants to know.
+     trigger = new event that is CLASS_I
+             OR existing event upgraded TO CLASS_I
+   store the previous severity to detect it.
+   DECIDE EXPLICITLY: an event that merely GAINS PRODUCTS is NOT a new
+   alert. with grouping, albertsons style events accumulate rows over
+   time and would otherwise re-fire.
+
+4. AT LEAST ONCE DELIVERY NEEDS A DEDUPE KEY
+   a crash mid send, or any retry, double notifies.
+   sent_alerts table, UNIQUE (device_id, event_id, trigger_type).
+   insert BEFORE sending. the duplicate insert failing is what makes
+   retries safe.
+
+5. QUIET HOURS NEED A TIMEZONE WE DO NOT HAVE
+   we store a STATE, and state != timezone. some states span two.
+   capture the device's utc offset at registration - the phone knows it.
+   never derive it from the state.
+   alternative, and the current preference: SKIP quiet hours in v1. a
+   class I food recall at 2am is arguably worth waking up for, and it is
+   less code. add it if people complain.
+
+6. BATCHING
+   a wednesday batch can land several class I at once (worst month: 28
+   nationally).
+   one sync run produces AT MOST ONE notification per device. two or
+   more recalls become "3 new Class I recalls in TX" opening a list.
+   considered: one notification per recall with a daily cap. better
+   detail per alert, worse on bad days.
+
+7. DEVICE LIFECYCLE
+   push providers report dead tokens (unregistered). delete those rows
+   on that response or the device table fills with uninstalled phones.
+   cheap, and easy to forget until it is a problem.
+
+8. SYNC CADENCE
+   weekly wednesday batches mean a 6 HOUR cycle is plenty - alerts land
+   within hours of publication and hourly polling buys nothing.
+   the phase 1 refresh loop becomes the sync job with almost no change.
+
+9. SILENT FAILURE GETS WORSE HERE
+   in phase 1 a stalled refresh shows stale data. in phase 2 a stalled
+   sync means NO ALERTS FIRE AND NOBODY NOTICES - the app looks calm,
+   and calm reads as good news.
+   needs an operator facing heartbeat, not just /health. same open item
+   as cache monitoring, higher stakes.
+
+10. RETENTION
+   do NOT delete rows when they age out of the 18 month window. history
+   is half the reason the database exists, and first_seen_at has to stay
+   stable forever.
