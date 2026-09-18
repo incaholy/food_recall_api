@@ -906,3 +906,77 @@ TESTS NEVER HIT THE LIVE API
 
   one separate, opt-in script may hit the real api to REFRESH those
   fixtures. it is run by hand, never in ci.
+
+
+PARSER - MEASURED, AND WHY FULL STATE NAMES ARE REQUIRED
+---------------------------------------------------------
+decided 2026-09-17. the three rules under LOCATION FILTERING still hold.
+this is what running them over all 841 real events actually produced.
+
+  code matching only          names + codes
+  --------------------        ---------------
+  nationwide keyword    80    nationwide keyword    80
+  parsed to states     597    parsed to states     716
+  rule 3 fallback      164    rule 3 fallback       45
+                    (19.5%)                      (5.4%)
+
+ONE IN FIVE RECALLS WAS BEING SHOWN TO EVERY STATE, and not because the
+data was vague - because people write the names out:
+
+    'Texas'
+    'Florida and Georgia'
+    'Distributed in Idaho, Oregon, and Washington'
+    'Texas, Colorado, New Mexico, Kentucky, Oklahoma, Missouri,
+     Arkansas, California'
+
+rule 3 keeps that SAFE - nobody misses a recall - but it destroys
+precision, and in phase 2 a texas only recall would push a notification
+to all 50 states. alert fatigue is how a safety feature dies.
+
+THE PARSER, IN ORDER
+  1. nationwide keywords first. if any hit, done, is_nationwide = True.
+     nationwide, nationally, all 50 states, all fifty states,
+     united states, u.s., usa, across the us
+     the last four were added because they were already landing on rule
+     3 by luck. make it a rule, not an accident.
+  2. DC special case BEFORE Washington.
+     measured bug: 'Sold in Washington, DC' -> ['DC','WA'].
+     match washington d.c. / washington dc first, consume it.
+  3. full state names, LONGEST FIRST, consuming each match.
+     order matters and is verified:
+       'Distributed in West Virginia only' -> ['WV']   not VA
+       'WEST VIRGINIA AND VIRGINIA'        -> ['VA','WV']
+       'Shipped to Kansas and Arkansas'    -> ['AR','KS']  kansas does
+                                              not match inside arkansas
+       'Distributed in Mexico'             -> nationwide, not NM
+     names match case-insensitively. they are words, the case trick does
+     not apply to them.
+  4. two letter codes on what is LEFT, still CASE SENSITIVE.
+     this is the original trick and it stays: OR IN ME OK HI DE PA are
+     english words, prose writes them lowercase.
+  5. nothing found -> is_nationwide = True.  (rule 3, unchanged)
+
+THE STATE ENUM MUST INCLUDE TERRITORIES
+  measured in the window: DC 32, PR 8, GU 2, VI 2.
+  leave them out and they parse fine and then fail validation.
+  include AS and MP too, they are the same kind of thing.
+
+KNOWN LIMITATION - UPPERCASE PROSE
+  'Product distributed IN OR ME only' -> ['IN','ME','OR'].
+  the case trick cannot survive prose written in caps. in the real
+  window all 128 mostly-uppercase patterns were plain code lists, so
+  this is rare, and it fails in the SAFE direction - a false match
+  ADDS a state, which over-includes. leave it. write the test case so
+  the behaviour is documented rather than discovered later.
+
+THE 45 REMAINING FALLBACKS ARE GENUINELY UNPARSEABLE
+    'Distribution for all products is limited to one direct account
+     consignee (Tokyo Central)'
+    'Product was sold to two(2) distributors.'
+    'Will be provided when available.'
+  there is no state in that text. nationwide is the right answer.
+
+TEST CASES - ALL OF THE ABOVE ARE THE FIXTURE
+  every string quoted in this section goes in the parser test suite,
+  including the traps and the known limitation. they are real values
+  from the live api, not invented ones.
