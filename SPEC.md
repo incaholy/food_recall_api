@@ -1072,3 +1072,84 @@ VOLUME - MEASURED, AND IT VALIDATES "CLASS I ONLY"
    do NOT delete rows when they age out of the 18 month window. history
    is half the reason the database exists, and first_seen_at has to stay
    stable forever.
+
+
+STALENESS MONITORING AND DEPLOYMENT REQUIREMENTS
+-------------------------------------------------
+decided 2026-09-17.
+
+WHAT THE THRESHOLDS ACTUALLY MEASURE
+  openfda publishes WEEKLY. so a snapshot being 24h old is not a data
+  problem at all - it means OUR REFRESH HAS BEEN FAILING. the thresholds
+  measure fetch health, not data freshness. do not confuse the two:
+    fetched_at   when we last succeeded      -> fetch health
+    data_as_of   newest report_date we hold  -> actual data freshness
+
+  refresh interval   6h
+    ok       age <  12h   (one missed cycle is normal, retries happen)
+    stale    age >= 12h   two cycles gone. something is wrong.
+    critical age >= 24h   four cycles gone. it is not coming back alone.
+    empty                 the first fetch never succeeded, nothing to serve
+
+/HEALTH
+  returns, always:
+    status              ok | stale | critical | empty
+    fetched_at          utc
+    age_seconds
+    data_as_of          newest report_date in the snapshot
+    event_count / product_count
+    consecutive_failures
+    last_failure_at     timestamp only. never the upstream error body.
+
+  http status: 200 for ok/stale/critical, 503 ONLY for empty (we cannot
+  serve at all). a stale cache still serves useful data and should not
+  be reported as down.
+  uptime checks that need more should match on the status FIELD, not the
+  http code.
+  /health is exempt from rate limiting so checks never trip it.
+
+THE FAILURE THAT MATTERS IS ABSENCE
+  a stalled refresh makes no noise. nothing errors, no request fails,
+  the app just quietly serves older and older data. in phase 2 it is
+  worse - no alerts fire and the app looks calm, and calm reads as good
+  news.
+
+  polling /health cannot catch this on its own, because something has to
+  be doing the asking. use a DEAD MAN'S SWITCH:
+    the refresh job pings a check-in url on every SUCCESS.
+    if the pings stop for longer than the grace period, THAT service
+    emails you.
+    healthchecks.io has a free tier and is exactly this.
+  it alerts on silence, which is the actual failure mode here.
+
+  logging, in support of the above:
+    one structured line per refresh - pages, records, events, duration
+    failures at ERROR with the consecutive count, so a run of them is
+    obvious in the log rather than buried
+  no prometheus / metrics stack yet. overkill at this size.
+
+DEPLOYMENT REQUIREMENTS - HOST CHOSEN LATER
+  the host is not decided. these are the constraints it must satisfy,
+  and they are not negotiable:
+
+    - a LONG LIVED process. the background refresh loop must keep
+      running with no request traffic.
+    - NEVER SLEEPS / no scale to zero. an idle timeout kills the loop,
+      and every cold start refetches.
+    - EXACTLY ONE WORKER / one instance. N workers = N independent
+      caches, N times the quota burn, and a different last_fetched
+      depending on which one answers.
+    - >= 256MB ram. the snapshot itself is only a few MB (2314 rows with
+      raw), the rest is python.
+    - outbound https to api.fda.gov.
+    - restart policy that brings the process back up. on restart the
+      cache is empty and /health returns 503 until the first fetch
+      lands - that is expected, do not crash loop.
+
+  this RULES OUT lambda, vercel functions, cloud run scaled to zero, and
+  render's free tier (spins down after 15 min idle).
+  it is satisfied by fly.io with auto_stop_machines = false, render's
+  paid tier, railway, or any small vps with systemd.
+
+  when the host IS chosen, record it here with the setting that keeps it
+  awake - that setting is the whole ball game.
