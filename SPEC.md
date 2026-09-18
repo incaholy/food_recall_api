@@ -65,7 +65,9 @@ everything below added 2026-08-26
 ================================================================
 
 
-NORMALIZED RECALL MODEL
+NORMALIZED RECALL MODEL   [AMENDED 2026-09-17 - see GROUPING below:
+                           source_id is now event_id, raw is a LIST of
+                           rows, and products/product_count are added]
 -----------------------
 the canonical shape every recall is converted into before it reaches
 the rest of the app. one mapper per source, all mess stays in the mapper.
@@ -487,11 +489,16 @@ OPEN DECISIONS - RESOLVED 2026-09-17
 3. username or email - moot, no users in phase 1.
 4. DELETE /me cascade - moot, endpoint is gone. with nothing stored per
    user there was never anything to cascade.
-5. report_date vs recall_initiation_date - STILL OPEN. it decides what
-   the query window means. related: the window should be TRAILING
-   (last 12-24 months), not the calendar year. on jan 2 a calendar year
-   filter leaves the cache nearly empty while december recalls are
-   still very much active.
+5. report_date vs recall_initiation_date - RESOLVED 2026-09-17:
+   report_date. it is when fda PUBLISHES, which is what makes "new"
+   meaningful, and it is what the weekly batching lands on. everything
+   downstream already assumes it - the cache window, sort=report_date:asc,
+   the 30 day default, data_as_of.
+   recall_initiation_date is kept on the model for display only; it can
+   be months earlier and would make records appear out of order.
+   the window is TRAILING (18 months), never a calendar year. on jan 2 a
+   calendar filter leaves the cache nearly empty while december recalls
+   are still very much active.
 
 
 BUILD ORDER
@@ -588,3 +595,314 @@ PARSING IS SOURCE SPECIFIC, FILTERING IS NOT
   is_nationwide and states off the normalized model. it must stay a
   function over Recall objects - not a sql string, not a lucene string -
   so the phase 2 database swap changes only where the list comes from.
+
+
+PAGING - THE WINDOW NO LONGER FITS IN ONE REQUEST
+--------------------------------------------------
+added 2026-09-17. this corrects the earlier "861 records fit in ONE
+request" assumption, which is now false. measured today:
+
+  calendar 2026          950 records   (was 861 in august, cap is 1000)
+  trailing 12 months    1419 records
+  trailing 18 months    2314 records
+
+calendar-year will cross the 1000 cap on its own within months, so
+paging is on the MAIN PATH, not a someday feature.
+
+hard limits, verified against the live api 2026-09-17:
+  limit=1001   -> 400 "Limit cannot exceed 1000 results for search
+                  requests. Use the skip or search_after param"
+  skip=26000   -> 400 "Skip value must 25000 or less."
+  sort=report_date:asc  -> supported
+  skip=1000 on the 18mo window -> 1000 rows, meta.results.total 2314
+  skip=2000                    -> the remaining 314
+
+THE WINDOW
+  config value WINDOW_MONTHS, default 18, trailing - never a calendar
+  year. on jan 2 a calendar filter leaves the cache nearly empty while
+  december recalls are still active. one setting, easy to tune.
+
+THE PAGING LOOP
+  page size is always 1000 (the max - fewer pages, fewer round trips).
+  always send sort=report_date:asc. skip paging without a sort is
+  undefined ordering, and rows can shift between pages.
+
+  1. fetch page 1: limit=1000, skip=0, sort=report_date:asc
+  2. read meta.results.total
+  3. pages_needed = ceil(total / 1000)
+  4. fetch the rest with skip=1000, 2000, ...
+  5. assemble, de-duping on recall_number as a belt-and-braces guard
+     against a record being added mid-page-run
+
+  sequential, not parallel. three requests a few hundred ms apart is
+  polite and simple; there is nothing to win by hammering them.
+
+  MAX_PAGES = 10 (10k records). if total exceeds that, raise instead of
+  looping. either the window got too wide or something is wrong - do not
+  silently pull 25k records.
+
+  skip caps at 25000. we are nowhere near it at 2314, but if the window
+  ever grows past that, switch to search_after, which the 400 message
+  above names as the supported alternative.
+
+ALL OR NOTHING
+  the refresh builds a complete new list and only then rebinds the
+  snapshot. if ANY page fails the whole run is discarded, the old
+  snapshot stays, fetched_at is untouched, and it retries next cycle.
+
+  a half built snapshot is worse than a stale one: a user in a state
+  whose recalls happened to live on page 3 would silently see nothing
+  and have no way to know. same reasoning as rule 3 in the location
+  filtering - never hide a real recall.
+
+  fetch_recalls() therefore returns the COMPLETE window or raises. it
+  never returns a partial result.
+
+QUOTA
+  3 pages x ~6 refreshes a day = ~18 calls/day against an unauthenticated
+  limit of roughly 1000/day per ip. still ~2%. an api key is not needed
+  but raises the ceiling to ~120k/day if it ever is.
+
+
+THE DEFAULT RESULT WINDOW - 30 DAYS, NOT 7
+-------------------------------------------
+decided 2026-09-17. two different windows, do not confuse them:
+
+  CACHE window    18 months   what we hold in memory (2314 rows, 3 pages)
+  RESULT window   30 days     what GET /recalls returns by default
+
+7 days was the first instinct and the data killed it. openfda does not
+publish continuously, it publishes in WEEKLY BATCHES, every report_date
+in the last 90 days is a wednesday:
+
+    20260805  rows=  3  events=  3
+    20260812  rows= 35  events= 14
+    20260819  rows= 29  events=  8
+    20260826  rows= 25  events= 10
+    20260902  rows= 21  events= 12
+    20260909  rows= 20  events= 10
+
+measured 2026-09-17:
+    last 7 days     0 rows   <- openfda returns 404, EMPTY APP
+    last 14 days   20 rows
+    last 30 days   95 rows   (~40 events)
+    last 90 days  250 rows   (109 events)
+
+today is the 17th and the newest batch is the 9th. because batches land
+exactly 7 days apart, a 7 day lookback has ZERO margin - it goes empty
+in the day or two before each batch and stays empty whenever a publish
+slips. an empty recall app looks broken, or worse, looks like good news.
+
+30 days always spans about 4 batches, so it is never empty, and ~40
+events is a reasonable first screen.
+
+  GET /recalls              -> last 30 days
+  GET /recalls?days=7       -> caller can narrow
+  GET /recalls?days=180     -> caller can widen, CAPPED at the cache
+                               window. asking for more than we hold must
+                               not silently return less than asked.
+
+  the envelope states the window used, in days and as actual dates, so
+  "nothing found" is never ambiguous about what was searched.
+  also surface the newest report_date present - that is the real
+  "data as of", and it is not the same as our fetched_at.
+
+  note the batching means a 404 from openfda on a narrow window is
+  NORMAL, not an error. rule stands: 404 -> [].
+
+
+GROUPING - ONE RECALL IS ONE EVENT, NOT ONE PRODUCT
+----------------------------------------------------
+decided 2026-09-17. openfda's enforcement endpoint returns ONE ROW PER
+PRODUCT. the earlier model treated each row as a Recall keyed on
+recall_number, which turns one real recall into dozens of near identical
+entries.
+
+measured over the 18 month window:
+    rows                        2314
+    actual events (event_id)     841
+    single row events            563   (67%)
+    events with >=10 rows         44   but those hold 944 rows = 41%
+    biggest                      121   rows, Albertsons Companies LLC
+
+the damage is concentrated. most recalls are one row, a handful flood
+everything. with a 30 day default (~95 rows) one big event can be most
+of the screen. in phase 2 it would be 121 push notifications for ONE
+recall.
+
+the albertsons event, 121 rows, is a single real recall:
+    one firm, one status (Terminated), one distribution (Nationwide.),
+    reason differs only by capitalisation -
+      "Contains statement does not declare pecan"
+      "Contains statement does not declare Pecan"
+
+GROUPING IS SAFE - every field we filter or sort on is already constant
+inside an event. counted across all 841:
+    recalling_firm          0 mixed     report_date              0 mixed
+    status                  0 mixed     recall_initiation_date   0 mixed
+    distribution_pattern    0 mixed     state / city / country   0 mixed
+    classification         11 mixed     reason_for_recall       46 mixed
+  event_id present on 100% of rows. recall_number unique across the
+  window. only two fields need a rule.
+
+THE RULES
+  source_id      = event_id.  recall_number moves into the product list
+  severity       = the WORST class in the event. class I wins.
+                   albertsons is {Class II, Class III} -> CLASS_II.
+                   never let a class I hide inside a group - this feeds
+                   both the severity filter and the phase 2 alert.
+  status/dates/  = take from any row, they are provably identical
+  distribution
+  reason         = distinct reasons, compared case-insensitively so
+                   pecan/Pecan collapse. keep the list when they really
+                   differ (46 events).
+  products       = [{recall_number, description}]  + product_count,
+                   so the ui says "121 products", not 121 rows
+  raw            = the LIST of source rows. keeps the re-normalize
+                   promise: a better parser replays over stored rows.
+
+  GET /recalls/{id} accepts EITHER an event_id OR a recall_number.
+  recall_number is what fda shows publicly and what a user would paste.
+
+  fallbacks: a row with no event_id becomes its own event (0 cases in
+  the window today). one row in the window has NO recall_number - do not
+  assume it exists.
+
+  ?flat=true returns the ungrouped source rows. escape hatch for
+  debugging and for anyone who wants what openfda actually sent.
+
+WHERE IT LIVES
+  in the mapper, inside app/openfda/. event_id is an openfda concept,
+  fsis has no equivalent. the interface changes shape:
+      map_records(rows) -> list[Recall]
+  batch in, batch out - grouping has to see all the rows at once. this
+  is the only structural change; everything downstream still sees Recall
+  objects and needs no edit.
+
+COUNTS NOW MEAN EVENTS
+  total: 40 means 40 recalls, which may cover 200 products. the envelope
+  reports BOTH (total events + total products) so nothing looks missing.
+  limit/offset paginate EVENTS, which is what makes limit meaningful -
+  20 flat rows could be a fifth of one recall.
+
+
+THE ENVELOPE, LIMITS, ERRORS AND CORS
+--------------------------------------
+decided 2026-09-17. the small contract details that a frontend cannot
+be written without.
+
+HAS_CRITICAL - IT DESCRIBES THE AREA, NOT THE PAGE
+  the old wording "any returned recall is CLASS_I and ACTIVE" was
+  ambiguous twice over: page 2 could flip it to false, and a user
+  filtering severity=CLASS_III would see NO warning while an active
+  class I sits in their state. that is the exact case the banner exists
+  for.
+
+  has_critical  computed over STATE + WINDOW only. ignores the severity
+                filter, the status filter, and pagination.
+                it is a safety signal about where you live, not a
+                description of what is currently on screen.
+  critical_count  how many.
+  has_critical_in_results  the literal reading, for the current view.
+                cheap to add and it removes the ambiguity entirely.
+
+THE ENVELOPE
+  results                 list[Recall]   (events)
+  total                   event count matching the filters
+  total_products          product rows behind those events
+  limit / offset / has_more
+  window_days_requested / window_days_effective / clamped
+  window_start / window_end          actual dates, so "nothing found"
+                                     is never ambiguous
+  data_as_of              newest report_date in the cache - the REAL
+                          freshness, not the same as fetched_at
+  fetched_at              when WE last refreshed
+  disclaimer              openfda meta.disclaimer, every response
+  has_critical / critical_count / has_critical_in_results
+
+LIMIT AND OFFSET
+  default limit 50, max 200, counted in EVENTS. a 30 day window is ~40
+  events so the default shows nearly everything without paging.
+  offset past the end -> empty list, not an error.
+  with ?flat=true limits count ROWS instead, max 500.
+  rejected: cursor pagination (overkill for an in memory list) and no
+  cap at all (a public endpoint footgun - limit=100000 would serialise
+  the whole snapshot).
+
+ERROR SHAPE - ONE FORMAT EVERYWHERE
+  {"error": {"code": "...", "message": "...", "detail": {...}}}
+
+  UNKNOWN_RECALL     404  id not in the window. message states the
+                          window, since the id may be real but old.
+  CACHE_EMPTY        503  first fetch never succeeded. include
+                          retry_after. do NOT crash loop.
+  VALIDATION_ERROR   422  normalised from fastapi's own shape through an
+                          exception handler, so clients parse ONE format.
+  never leak an upstream openfda error body to the client. log it.
+
+  days over the cap CLAMPS, it does not error - but it is not silent:
+  window_days_requested, window_days_effective and clamped say so.
+  considered and rejected: 422 on an over cap days. stricter, but
+  annoying for a caller who just wants everything.
+
+CORS
+  CORSMiddleware, origins from config, GET only, no credentials.
+  default "*" - defensible here: the data is public, there is no auth
+  and no cookies.
+  the config knob exists from day one anyway, because an explicit origin
+  list becomes REQUIRED the moment anything credentialed is added.
+  phase 1 assumes the client stores the saved state in localStorage, so
+  without cors nothing in a browser can call this api at all.
+
+
+TIME, RATE LIMITING, AND TESTS AGAINST A LIVE API
+--------------------------------------------------
+decided 2026-09-17.
+
+TIME IS UTC, ALWAYS
+  fetched_at and every other timestamp we generate are UTC, timezone
+  aware, serialised with an explicit offset. never a naive local time -
+  the server's timezone is an accident of where it happens to run.
+
+  openfda's dates are a different thing: report_date and
+  recall_initiation_date are naive CALENDAR DATES (YYYYMMDD, no time, no
+  zone). keep them as dates. do not invent a midnight and do not shift
+  them into a timezone - a recall was reported on a day, not at an
+  instant.
+
+  the window is computed from utc "today". near midnight a user in
+  another timezone may see a window edge that differs from their local
+  date by a day. that is acceptable and it is the same for everyone.
+
+RATE LIMITING - REQUIRED, BUT AFTER THE ENDPOINTS EXIST
+  NOT built yet, deliberately. build the endpoints first, add limiting
+  once their real shape is known. this is a TODO, not a non goal.
+
+  why it is still needed even though everything is served from memory:
+  the endpoints are public and unauthenticated, there is nothing to stop
+  one client looping /recalls, and a 200 event response is not free to
+  serialise. the cost is cpu and bandwidth, not openfda quota - our
+  upstream calls are already fixed at ~18/day no matter what callers do.
+
+  when it is added:
+    - per ip, on the read endpoints
+    - generous. this is a public safety data api, being stingy with it
+      would be the wrong failure. something like 60/min/ip.
+    - 429 with retry_after, in the standard error envelope
+    - /health stays unlimited so uptime checks never trip it
+    - behind a proxy, honour x-forwarded-for or the limit is applied to
+      the proxy and locks out everyone at once
+
+TESTS NEVER HIT THE LIVE API
+  no test makes a real openfda request. ever.
+  reasons: ci would burn the shared ~1000/day ip quota, the suite would
+  fail whenever fda is down or slow, and results would change weekly as
+  new recalls land.
+
+  instead: saved fixtures in tests/fixtures/ captured from real
+  responses - a normal page, a 404 body, a 400 body, a multi page run,
+  and the 121 row albertsons event for the grouping tests.
+  httpx MockTransport serves them.
+
+  one separate, opt-in script may hit the real api to REFRESH those
+  fixtures. it is run by hand, never in ci.
